@@ -15,6 +15,12 @@
 
 ---
 
+> **About this fork:** a restyled fork of [HandyS11/cloudcli-plugin-claude-usage](https://github.com/HandyS11/cloudcli-plugin-claude-usage),
+> made to match the theme of [ango-dev/claudecodeui](https://github.com/ango-dev/claudecodeui), a Claude Code-only
+> build of CloudCLI. It follows the host's colours, fonts and light/dark mode, shows as a **Usage** tab with a
+> header like the built-in tabs, and fits phone widths. The plugin itself is HandyS11's work; its name, author
+> credit and licence are kept.
+
 ![Claude Usage plugin running in a CloudCLI tab: plan-limit gauges, 30-day token chart, and per-model/per-project cost breakdowns](banner.png)
 
 # Claude Usage — CloudCLI Plugin
@@ -34,7 +40,7 @@ Open **Settings > Plugins** in CloudCLI UI, paste this repository's URL, and
 click **Install**. Or manually:
 
 ```bash
-git clone https://github.com/HandyS11/cloudcli-plugin-claude-usage.git ~/.claude-code-ui/plugins/claude-usage
+git clone https://github.com/ango-dev/cloudcli-plugin-claude-usage.git ~/.claude-code-ui/plugins/claude-usage
 cd ~/.claude-code-ui/plugins/claude-usage
 npm install && npm run build
 ```
