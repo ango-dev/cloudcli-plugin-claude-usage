@@ -21,6 +21,10 @@
 > header like the built-in tabs, and fits phone widths. The plugin itself is HandyS11's work; its name, author
 > credit and licence are kept.
 
+> **AI use:** this fork's changes (the restyle, phone layout and chart readout) were written with an AI coding
+> assistant, Claude Code. They were checked with the build, the tests and screenshots in light and dark mode,
+> but may still contain mistakes.
+
 ![Claude Usage plugin running in a CloudCLI tab: plan-limit gauges, 30-day token chart, and per-model/per-project cost breakdowns](banner.png)
 
 # Claude Usage — CloudCLI Plugin
