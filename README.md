@@ -17,9 +17,9 @@
 
 > **About this fork:** a restyled fork of [HandyS11/cloudcli-plugin-claude-usage](https://github.com/HandyS11/cloudcli-plugin-claude-usage),
 > made to match the theme of [ango-dev/claudecodeui](https://github.com/ango-dev/claudecodeui), a Claude Code-only
-> build of CloudCLI. It follows the host's colours, fonts and light/dark mode, shows as a **Usage** tab with a
-> header like the built-in tabs, and fits phone widths. The plugin itself is HandyS11's work; its name, author
-> credit and licence are kept.
+> build of CloudCLI. HandyS11 has since merged the restyle upstream ([#8](https://github.com/HandyS11/cloudcli-plugin-claude-usage/pull/8)),
+> so this fork now tracks upstream and only shows the tab as **Usage** instead of "Claude Usage". The plugin
+> itself is HandyS11's work; its name, author credit and licence are kept.
 
 > **AI use:** this fork's changes (the restyle, phone layout and chart readout) were written with an AI coding
 > assistant, Claude Code. They were checked with the build, the tests and screenshots in light and dark mode,
@@ -33,7 +33,8 @@ Shows the current usage of Claude Code in a CloudCLI tab:
 
 - **Live plan limits** — session (5h window), weekly, and per-model utilization
   gauges with severity coloring and reset countdowns, straight from the same
-  endpoint that powers Claude Code's `/usage` screen. Auto-refreshes every 60s.
+  endpoint that powers Claude Code's `/usage` screen. Auto-refreshes every
+  5 minutes (the endpoint is strictly rate-limited, see below).
 - **30-day history** — daily token bar chart, totals (tokens / estimated cost /
   sessions), and per-model / per-project breakdowns, parsed locally from
   `~/.claude/projects/**/*.jsonl` transcripts.
@@ -55,9 +56,12 @@ The backend subprocess (`dist/server.js`) exposes two endpoints via the host's
 RPC proxy:
 
 - `GET /live` — reads the OAuth token from `~/.claude/.credentials.json` and
-  calls `https://api.anthropic.com/api/oauth/usage` (cached 30s). It never
+  calls `https://api.anthropic.com/api/oauth/usage` (cached 5 minutes). It never
   writes to the credentials file and never uses the refresh token; if the token
-  is expired it asks you to run `claude` to refresh it.
+  is expired it asks you to run `claude` to refresh it. The plan badge shows the
+  plan's display name (e.g. "Ultra") from `https://api.anthropic.com/api/oauth/profile`
+  (cached 1 hour per token), since the credentials file only holds internal codes
+  like `max` / `max_20x`; those codes are the fallback and the badge's hover text.
 - `GET /history?days=30` — parses local session transcripts (deduped by message
   id, cached by file mtime) and aggregates tokens and estimated cost by day,
   model, and project. Costs use a bundled price table; unknown models show "—".
@@ -68,11 +72,26 @@ vice-versa.
 > **Note:** the usage endpoint is unofficial and may change; the live section
 > degrades gracefully if it does.
 
+### Rate limiting
+
+The usage endpoint allows only a handful of requests per window, and that
+budget is shared with Claude Code's own `/usage` screen and statusline (see
+[anthropics/claude-code#30930](https://github.com/anthropics/claude-code/issues/30930)).
+To stay well under it, the plugin:
+
+- calls the endpoint at most once every 5 minutes, no matter how many tabs are
+  open or how often you click refresh (concurrent requests share one call);
+- on HTTP 429 honors `Retry-After` when present, otherwise backs off
+  5 → 10 → 20 → 40 → 60 minutes between attempts;
+- keeps showing the last good reading (marked as stale, with the reason) while
+  it waits, instead of blanking the gauges.
+
 ## Development
 
 ```bash
 npm install
 npm test        # tsc + node --test dist/
+npm run lint    # ESLint + typescript-eslint + sonarjs rules
 npm run dev     # tsc --watch
 ```
 

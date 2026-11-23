@@ -9,13 +9,23 @@ import type { PluginAPI, PluginContext } from './types.js';
 
 interface TokenCounts { input: number; output: number; cacheCreate: number; cacheRead: number }
 interface LiveLimit { kind: string; label: string; percent: number; severity: string; resetsAt: string | null; model: string | null }
-interface LiveData { plan: string | null; tier: string | null; limits: LiveLimit[] }
+interface LiveData {
+  plan: string | null; tier: string | null; planName: string | null; limits: LiveLimit[];
+  fetchedAt: number; stale: boolean; error: string | null; retryAt: number | null;
+}
+
 interface HistoryData {
   daily: { date: string; tokens: TokenCounts; cost: number }[];
   byModel: { model: string; tokens: TokenCounts; cost: number | null }[];
   byProject: { project: string; tokens: TokenCounts; cost: number | null }[];
   totals: { tokens: TokenCounts; cost: number; sessions: number; messages: number };
 }
+
+// The usage endpoint rate-limits after a handful of calls and the limit is shared
+// with Claude Code's own /usage screen, so poll it rarely. The server caches for
+// the same interval and backs off on 429, so the refresh button is safe too.
+const LIVE_POLL_MS = 5 * 60_000;
+const TICK_MS = 60_000;
 
 // ── Theme (follows the CloudCLI host) ───────────────────────────────────
 // The plugin is mounted straight into the host page, so host CSS variables
@@ -104,6 +114,13 @@ function resetsIn(iso: string | null): string {
   return h > 0 ? `resets in ${h}h ${m}m` : `resets in ${m}m`;
 }
 
+function ago(ms: number): string {
+  const m = Math.floor(ms / 60_000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  return `${Math.floor(m / 60)}h ${m % 60}m ago`;
+}
+
 function esc(s: string): string {
   return s.replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch] as string));
 }
@@ -122,20 +139,43 @@ function errorNote(c: ThemeColors, msg: string): string {
   return `<div style="font-size:0.8rem;color:${c.warn}">⚠ ${esc(msg)}</div>`;
 }
 
+/** Badge text: the plan's display name ("Ultra") when known, else the raw codes ("max · max_20x"). */
+export function planLabel(
+  live: Pick<LiveData, 'plan' | 'tier' | 'planName'> | null,
+): { text: string; title: string | null } | null {
+  if (!live) return null;
+  let codes: string | null = null;
+  if (live.plan) {
+    codes = live.tier ? `${live.plan} · ${live.tier.replace(/^default_claude_/, '')}` : live.plan;
+  }
+  if (live.planName) return { text: live.planName, title: codes };
+  return codes ? { text: codes, title: null } : null;
+}
+
 function planBadge(c: ThemeColors, live: LiveData | null): string {
-  if (!live?.plan) return '';
-  const tier = live.tier ? ` · ${esc(live.tier.replace(/^default_claude_/, ''))}` : '';
-  return `<span style="flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;font-weight:600;line-height:1.4;border:1px solid ${c.border};border-radius:${radius(2)};padding:1px 8px;color:${c.muted}">${esc(live.plan)}${tier}</span>`;
+  const label = planLabel(live);
+  if (!label) return '';
+  const title = label.title ? ` title="${esc(label.title)}"` : '';
+  return `<span${title} style="flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;font-weight:600;line-height:1.4;border:1px solid ${c.border};border-radius:${radius(2)};padding:1px 8px;color:${c.muted}">${esc(label.text)}</span>`;
 }
 
 function renderLive(c: ThemeColors, live: LiveData | null, error: string | null): string {
+  const updated = live
+    ? `<span style="font-family:${MONO};font-size:0.65rem;font-weight:400;letter-spacing:0;text-transform:none;color:${c.muted};margin-left:8px">updated ${ago(Date.now() - live.fetchedAt)}</span>`
+    : '';
   let body: string;
   if (error) {
     body = errorNote(c, error);
   } else if (!live || live.limits.length === 0) {
     body = `<div style="font-size:0.75rem;color:${c.muted}">No limit data available.</div>`;
   } else {
-    body = live.limits.map((l) => {
+    if (live.stale && live.error) {
+      body = errorNote(c, `${live.error} Showing last reading from ${ago(Date.now() - live.fetchedAt)}.`)
+        + `<div style="height:10px"></div>`;
+    } else {
+      body = '';
+    }
+    body += live.limits.map((l) => {
       const color = sevColor(c, l.severity, l.percent);
       const pct = Math.max(0, Math.min(100, l.percent));
       return `
@@ -150,7 +190,7 @@ function renderLive(c: ThemeColors, live: LiveData | null, error: string | null)
         </div>`;
     }).join('');
   }
-  return card(c, 'plan limits', body);
+  return card(c, `plan limits ${updated}`, body);
 }
 
 /** The line under the chart: the date range, or the active day's figures. */
@@ -353,7 +393,6 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   render(api.context);
   void load(true);
 
-  // Live gauges poll every 60s while mounted; countdown text refreshes with them.
   // Chart readout. The browser's title tooltips never show on touch screens,
   // so a day is picked by hovering with a mouse, tapping or dragging a finger
   // along the bars, or the arrow keys once the chart has focus.
@@ -422,11 +461,15 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     if (!dragging && e.target instanceof Element && e.target.isConnected && inChart(e.target)) setActiveDay(null);
   });
 
-  const timer = window.setInterval(() => void load(false), 60_000);
+  // Live gauges re-fetch every 5 minutes; countdown / "updated" text re-renders
+  // every minute without touching the network.
+  const poll = window.setInterval(() => void load(false), LIVE_POLL_MS);
+  const tick = window.setInterval(() => render(api.context), TICK_MS);
   const unsubscribe = api.onContextChange((ctx) => render(ctx));
 
   (container as any)._cuCleanup = () => {
-    window.clearInterval(timer);
+    window.clearInterval(poll);
+    window.clearInterval(tick);
     window.removeEventListener('pointerup', endDrag);
     window.removeEventListener('pointercancel', endDrag);
     unsubscribe();

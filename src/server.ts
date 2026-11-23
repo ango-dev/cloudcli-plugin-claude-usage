@@ -2,20 +2,27 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { parseCredentials, normalizeUsage, LiveData } from './live.js';
-import { parseTranscriptLine, projectLabel, aggregate, SessionEntries, UsageEntry } from './history.js';
+import { parseCredentials, LiveCache, LiveResult, Credentials } from './live.js';
+import { PlanNameCache } from './profile.js';
+import { aggregate } from './history.js';
+import { loadSessions } from './transcripts.js';
 
 const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
-const LIVE_CACHE_MS = 30_000;
+const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
+
+function oauthHeaders(accessToken: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    'anthropic-beta': 'oauth-2025-04-20',
+    'Content-Type': 'application/json',
+  };
+}
 
 // ── /live ──────────────────────────────────────────────────────────────
 
-let liveCache: { at: number; data: LiveData } | null = null;
-
-async function getLive(): Promise<LiveData> {
-  if (liveCache && Date.now() - liveCache.at < LIVE_CACHE_MS) return liveCache.data;
-
+/** Local, no-network checks — never throttled, so a fresh login shows up immediately. */
+function readCredentials(): Credentials {
   let credsJson: unknown;
   try {
     credsJson = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf-8'));
@@ -27,68 +34,47 @@ async function getLive(): Promise<LiveData> {
   if (creds.expired) {
     throw Object.assign(new Error('OAuth token expired — run claude to refresh it, then retry.'), { status: 401 });
   }
+  return creds;
+}
 
+// The endpoint is shared with Claude Code's own /usage screen and rate-limits
+// after only a few calls, so LiveCache polls it at most every 5 minutes and
+// backs off on 429 (see live.ts).
+const liveCache = new LiveCache(async () => {
+  const creds = readCredentials();
   const res = await fetch(USAGE_URL, {
-    headers: {
-      Authorization: `Bearer ${creds.accessToken}`,
-      'anthropic-beta': 'oauth-2025-04-20',
-      'Content-Type': 'application/json',
-    },
+    headers: oauthHeaders(creds.accessToken),
     signal: AbortSignal.timeout(10_000),
   });
-  if (!res.ok) {
-    throw Object.assign(new Error(`Usage endpoint returned HTTP ${res.status}.`), { status: 502 });
-  }
-  const data = normalizeUsage(await res.json(), creds.plan, creds.tier);
-  liveCache = { at: Date.now(), data };
-  return data;
+  return {
+    status: res.status,
+    retryAfter: res.headers.get('retry-after'),
+    body: res.ok ? await res.json() : null,
+    plan: creds.plan,
+    tier: creds.tier,
+  };
+});
+
+// The plan's display name ("Ultra") is not in the credentials file; see profile.ts.
+const planNames = new PlanNameCache(async (accessToken) => {
+  const res = await fetch(PROFILE_URL, {
+    headers: oauthHeaders(accessToken),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`Profile endpoint returned HTTP ${res.status}.`);
+  return res.json();
+});
+
+async function getLive(): Promise<LiveResult & { planName: string | null }> {
+  const creds = readCredentials();
+  const [live, planName] = await Promise.all([liveCache.get(), planNames.get(creds.accessToken)]);
+  return { ...live, planName };
 }
 
 // ── /history ───────────────────────────────────────────────────────────
 
-// Per-file parse cache keyed by mtime, so repeated polls only re-read changed files.
-const fileCache = new Map<string, { mtimeMs: number; entries: UsageEntry[] }>();
-
-function readSessionFile(file: string): UsageEntry[] {
-  const mtimeMs = fs.statSync(file).mtimeMs;
-  const cached = fileCache.get(file);
-  if (cached && cached.mtimeMs === mtimeMs) return cached.entries;
-  const entries: UsageEntry[] = [];
-  for (const line of fs.readFileSync(file, 'utf-8').split('\n')) {
-    const e = parseTranscriptLine(line);
-    if (e) entries.push(e);
-  }
-  fileCache.set(file, { mtimeMs, entries });
-  return entries;
-}
-
-function getHistory(days: number) {
-  const projectsDir = path.join(CLAUDE_DIR, 'projects');
-  const sessions: SessionEntries[] = [];
-  let dirs: fs.Dirent[] = [];
-  try {
-    dirs = fs.readdirSync(projectsDir, { withFileTypes: true });
-  } catch {
-    // no transcripts at all — aggregate over nothing, frontend shows empty state
-  }
-  for (const dir of dirs) {
-    if (!dir.isDirectory()) continue;
-    const project = projectLabel(dir.name);
-    let files: string[] = [];
-    try {
-      files = fs.readdirSync(path.join(projectsDir, dir.name)).filter((f) => f.endsWith('.jsonl'));
-    } catch {
-      continue;
-    }
-    for (const f of files) {
-      try {
-        sessions.push({ project, entries: readSessionFile(path.join(projectsDir, dir.name, f)) });
-      } catch {
-        /* unreadable file — skip */
-      }
-    }
-  }
-  return aggregate(sessions, days, Date.now());
+async function getHistory(days: number) {
+  return aggregate(await loadSessions(path.join(CLAUDE_DIR, 'projects')), days, Date.now());
 }
 
 // ── HTTP wiring ────────────────────────────────────────────────────────
@@ -103,7 +89,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/history') {
       const days = Math.min(Math.max(Number(url.searchParams.get('days')) || 30, 1), 365);
-      res.end(JSON.stringify(getHistory(days)));
+      res.end(JSON.stringify(await getHistory(days)));
       return;
     }
     res.writeHead(404);
